@@ -1,14 +1,28 @@
 """
-Anime verification service.
+Anime Verification Service
 
 Flow:
-Telegram -> this service -> OpenAI Responses API -> Web Search
--> source verification -> structured anime result
+Telegram user
+    ↓
+Anime name
+    ↓
+OpenAI Responses API
+    ↓
+Web Search
+    ↓
+Official/public sources
+    ↓
+Cross-check
+    ↓
+Verified JSON
+    ↓
+Telegram bot
 
 IMPORTANT:
-- The model must use web sources for current information.
-- It must NOT invent Hindi dubbing, platform, episode or release data.
-- If something cannot be verified, it returns "Not verified".
+- OPENAI_API_KEY must be stored in Render Environment Variables.
+- Never put the API key directly inside this file.
+- Never guess Hindi dubbing or platform availability.
+- If information cannot be verified, return "Not verified".
 """
 
 import json
@@ -19,6 +33,10 @@ from typing import List, Optional
 from openai import AsyncOpenAI
 
 
+# ============================================================
+# PLATFORMS TO CHECK
+# ============================================================
+
 PLATFORMS = [
     "Sony YAY!",
     "SonyLIV",
@@ -26,13 +44,17 @@ PLATFORMS = [
     "Netflix",
     "JioHotstar",
     "Amazon MX Player",
-    "Prime Video / Anime Times",
+    "Prime Video",
+    "Anime Times",
     "ZEE5",
     "Muse India",
     "Ani-One India",
-    "Anime Times",
 ]
 
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
 
 @dataclass
 class PlatformVerification:
@@ -48,282 +70,578 @@ class PlatformVerification:
 @dataclass
 class AnimeData:
     title: str
+
     hindi: bool = False
     platform: str = "Not verified"
+
     season: str = "Not verified"
     episodes: Optional[int] = None
+
     languages: List[str] = field(default_factory=list)
+
     status: str = "Not verified"
+
     last_episode: Optional[int] = None
     last_release: Optional[str] = None
+
     next_episode: Optional[int] = None
     expected_release: Optional[str] = None
+
     schedule: Optional[str] = None
+
     studio: str = "Not verified"
     dub_by: str = "Not verified"
+
     source: str = "Not verified"
-    platform_checks: List[PlatformVerification] = field(default_factory=list)
+
+    platform_checks: List[PlatformVerification] = field(
+        default_factory=list
+    )
 
 
-def _client():
-    key = os.getenv("OPENAI_API_KEY")
+# ============================================================
+# OPENAI CLIENT
+# ============================================================
 
-    if not key:
+def get_openai_client():
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY environment variable is missing."
+            "OPENAI_API_KEY is missing. "
+            "Add it in Render → Environment."
         )
 
-    return AsyncOpenAI(api_key=key)
+    return AsyncOpenAI(api_key=api_key)
 
+
+# ============================================================
+# SEARCH / VERIFICATION
+# ============================================================
 
 async def find_anime(name: str) -> AnimeData:
 
-    query = name.strip()
+    anime_name = name.strip()
 
-    if not query:
-        raise ValueError("Please enter an anime name.")
+    if not anime_name:
+        raise ValueError(
+            "Please enter an anime name."
+        )
 
-    client = _client()
+    client = get_openai_client()
 
-    platforms_text = ", ".join(PLATFORMS)
+    model = os.getenv(
+        "OPENAI_MODEL",
+        "gpt-5-mini"
+    )
+
+    platforms = "\n".join(
+        f"- {platform}"
+        for platform in PLATFORMS
+    )
 
     prompt = f"""
-You are an anime information verification agent.
+You are an expert anime verification agent.
 
-Search the web before answering.
+The Telegram user searched for:
 
-User searched for:
-{query}
+{anime_name}
 
-TARGET PLATFORMS:
-{platforms_text}
+Your job is to SEARCH THE CURRENT WEB and verify the anime.
 
-TASK:
+DO NOT answer from memory alone.
 
-Find the correct anime and verify its information using
-reliable current web sources.
+============================================================
+PLATFORMS TO CHECK
+============================================================
 
-PRIORITY OF SOURCES:
+{platforms}
 
-1. Official platform pages
-2. Official anime/studio/publisher pages
+============================================================
+SOURCE PRIORITY
+============================================================
+
+Use sources in this priority:
+
+1. Official anime / publisher / studio websites
+2. Official streaming platform pages
 3. Official YouTube channels
-4. Reliable anime databases for neutral metadata
-5. Other reputable sources only when necessary
+4. Official social media announcements
+5. Reliable anime databases
+6. Reliable news sources
 
-For Hindi dubbing:
-- Do NOT assume Hindi exists.
-- Do NOT infer Hindi from subtitles.
-- Only mark Hindi as available when a source supports it.
+For Indian availability, prioritize Indian-region information.
 
-For platform:
-- Only name a platform when the anime is actually available
-  or officially announced there.
-- Prefer Indian-region availability when possible.
+============================================================
+HINDI DUB VERIFICATION
+============================================================
 
-For episodes:
-- Cross-check episode count.
-- For currently airing anime, find the latest released episode.
-- Find the next episode only when a reliable current source
-  provides enough information.
-- NEVER guess a release date.
+Hindi dubbing must NOT be guessed.
 
-Check the following platforms individually when relevant:
-{platforms_text}
+Hindi is VERIFIED only when a reliable source confirms it.
+
+Examples of evidence:
+
+- Hindi audio listed on an official streaming page
+- Official Hindi dub announcement
+- Official Indian YouTube announcement
+- Official platform audio-language information
+
+Hindi subtitles do NOT mean Hindi dub.
+
+If Hindi dubbing cannot be confirmed:
+
+"hindi": false
+
+and do not claim that Hindi is available.
+
+============================================================
+PLATFORM VERIFICATION
+============================================================
+
+Check whether the anime is available or officially announced
+on the listed platforms.
+
+Do not assume that an anime exists on a platform merely because
+the platform has anime content.
+
+For every platform that can be verified, include it in
+platform_checks.
+
+If no reliable evidence exists:
+
+verified = false
+
+============================================================
+EPISODE INFORMATION
+============================================================
+
+Find:
+
+- total episodes
+- current/latest episode
+- last release date
+- next episode
+- expected release date
+- release schedule
+
+Cross-check episode information.
+
+Do NOT invent release dates.
+
+If next episode/date cannot be confirmed:
+
+return null / "Not verified".
+
+============================================================
+SEASON INFORMATION
+============================================================
+
+Use official or reliable information.
+
+Examples:
+
+Season 1
+Season 2
+Season 3
+
+If the user searched for a franchise with multiple seasons,
+identify the correct anime entry.
+
+============================================================
+LANGUAGES
+============================================================
+
+Only list languages that are actually supported by evidence.
+
+Do not assume languages.
+
+============================================================
+DUB INFORMATION
+============================================================
+
+Find the Hindi dub studio / dubbing company / voice production
+information only if reliable evidence exists.
+
+Otherwise:
+
+"Not verified"
+
+============================================================
+STUDIO
+============================================================
+
+Find the animation studio from a reliable source.
+
+============================================================
+CURRENT STATUS
+============================================================
+
+Possible examples:
+
+🟢 Ongoing
+🔵 Completed
+⏸ Hiatus
+Not verified
+
+============================================================
+VERY IMPORTANT
+============================================================
+
+NEVER hallucinate.
+
+If something cannot be verified from web sources:
+
+"Not verified"
+
+The answer must be based on CURRENT web search results.
+
+============================================================
+OUTPUT
+============================================================
 
 Return ONLY valid JSON.
 
-Required JSON format:
+Use exactly this structure:
 
 {{
-  "title": "Anime title",
-  "hindi": false,
-  "platform": "Not verified",
-  "season": "Season 1",
-  "episodes": 12,
-  "languages": ["Japanese", "English", "Hindi"],
-  "status": "🟢 Ongoing",
-  "last_episode": 10,
-  "last_release": "2026-09-05",
-  "next_episode": 11,
-  "expected_release": "2026-09-12",
-  "schedule": "Every Saturday",
-  "studio": "Studio name",
-  "dub_by": "Not verified",
-  "source": "Official sources",
-  "platform_checks": [
-    {{
-      "platform": "Crunchyroll",
-      "found": true,
-      "hindi": true,
-      "languages": ["Japanese", "English", "Hindi"],
-      "episodes": 12,
-      "verified": true,
-      "source_url": "https://..."
-    }}
-  ]
+    "title": "Anime title",
+
+    "hindi": false,
+
+    "platform": "Not verified",
+
+    "season": "Season 1",
+
+    "episodes": 12,
+
+    "languages": [
+        "Japanese",
+        "English"
+    ],
+
+    "status": "🔵 Completed",
+
+    "last_episode": 12,
+
+    "last_release": "2026-09-05",
+
+    "next_episode": null,
+
+    "expected_release": null,
+
+    "schedule": "Not verified",
+
+    "studio": "Studio name",
+
+    "dub_by": "Not verified",
+
+    "source": "Official sources",
+
+    "platform_checks": [
+        {{
+            "platform": "Crunchyroll",
+            "found": true,
+            "hindi": true,
+            "languages": [
+                "Japanese",
+                "English",
+                "Hindi"
+            ],
+            "episodes": 12,
+            "verified": true,
+            "source_url": "https://example.com"
+        }}
+    ]
 }}
 
-RULES:
+Rules:
 
-- Use "Not verified" instead of guessing.
-- Boolean fields must be true/false.
-- episodes, last_episode and next_episode must be numbers
-  or null.
-- If Hindi cannot be verified, hindi=false.
-- If no platform can be verified, platform="Not verified".
-- Do not manufacture URLs.
-- Use source URLs actually found during web search.
+- JSON only.
+- No markdown.
+- No explanation outside JSON.
+- Boolean values must be true/false.
+- Unknown information must be null or "Not verified".
+- Never fabricate URLs.
+- source_url must be a URL actually found during search.
 """
 
-    response = await client.responses.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.6-luna"),
-        tools=[
-            {
-                "type": "web_search"
-            }
-        ],
-        input=prompt,
-    )
+    try:
 
-    text = response.output_text.strip()
+        response = await client.responses.create(
 
-    # Remove accidental markdown fences.
-    if text.startswith("```"):
-        text = text.replace("```json", "", 1)
-        text = text.replace("```", "")
-        text = text.strip()
+            model=model,
+
+            tools=[
+                {
+                    "type": "web_search"
+                }
+            ],
+
+            input=prompt
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"OpenAI request failed: {str(e)}"
+        )
+
+
+    raw = response.output_text.strip()
+
+
+    # Remove accidental markdown fences
+    if raw.startswith("```"):
+
+        raw = raw.replace(
+            "```json",
+            "",
+            1
+        )
+
+        raw = raw.replace(
+            "```",
+            ""
+        )
+
+        raw = raw.strip()
+
 
     try:
-        data = json.loads(text)
+
+        result = json.loads(raw)
 
     except json.JSONDecodeError:
-        raise ValueError(
-            "The verification service returned an invalid result. "
-            "Please try again."
+
+        raise RuntimeError(
+            "OpenAI returned invalid JSON. "
+            "Please try the search again."
         )
+
+
+    # ========================================================
+    # PLATFORM RESULTS
+    # ========================================================
 
     platform_checks = []
 
-    for item in data.get("platform_checks", []):
+    for item in result.get(
+        "platform_checks",
+        []
+    ):
 
         if not isinstance(item, dict):
             continue
 
         platform_checks.append(
+
             PlatformVerification(
+
                 platform=str(
-                    item.get("platform", "Not verified")
+                    item.get(
+                        "platform",
+                        "Not verified"
+                    )
                 ),
-                found=bool(item.get("found", False)),
-                hindi=bool(item.get("hindi", False)),
-                languages=item.get("languages") or [],
-                episodes=item.get("episodes"),
-                verified=bool(item.get("verified", False)),
-                source_url=item.get("source_url"),
+
+                found=bool(
+                    item.get(
+                        "found",
+                        False
+                    )
+                ),
+
+                hindi=bool(
+                    item.get(
+                        "hindi",
+                        False
+                    )
+                ),
+
+                languages=(
+                    item.get(
+                        "languages",
+                        []
+                    )
+                    or []
+                ),
+
+                episodes=item.get(
+                    "episodes"
+                ),
+
+                verified=bool(
+                    item.get(
+                        "verified",
+                        False
+                    )
+                ),
+
+                source_url=item.get(
+                    "source_url"
+                )
             )
         )
 
+
+    # ========================================================
+    # FINAL OBJECT
+    # ========================================================
+
     return AnimeData(
+
         title=str(
-            data.get("title") or query
+            result.get(
+                "title",
+                anime_name
+            )
         ).upper(),
 
         hindi=bool(
-            data.get("hindi", False)
+            result.get(
+                "hindi",
+                False
+            )
         ),
 
         platform=str(
-            data.get("platform") or "Not verified"
+            result.get(
+                "platform",
+                "Not verified"
+            )
+            or "Not verified"
         ),
 
         season=str(
-            data.get("season") or "Not verified"
+            result.get(
+                "season",
+                "Not verified"
+            )
+            or "Not verified"
         ),
 
-        episodes=data.get("episodes"),
+        episodes=result.get(
+            "episodes"
+        ),
 
-        languages=data.get("languages") or [],
+        languages=(
+            result.get(
+                "languages",
+                []
+            )
+            or []
+        ),
 
         status=str(
-            data.get("status") or "Not verified"
+            result.get(
+                "status",
+                "Not verified"
+            )
+            or "Not verified"
         ),
 
-        last_episode=data.get("last_episode"),
+        last_episode=result.get(
+            "last_episode"
+        ),
 
-        last_release=data.get("last_release"),
+        last_release=result.get(
+            "last_release"
+        ),
 
-        next_episode=data.get("next_episode"),
+        next_episode=result.get(
+            "next_episode"
+        ),
 
-        expected_release=data.get(
+        expected_release=result.get(
             "expected_release"
         ),
 
-        schedule=data.get("schedule"),
+        schedule=result.get(
+            "schedule"
+        ),
 
         studio=str(
-            data.get("studio") or "Not verified"
+            result.get(
+                "studio",
+                "Not verified"
+            )
+            or "Not verified"
         ),
 
         dub_by=str(
-            data.get("dub_by") or "Not verified"
+            result.get(
+                "dub_by",
+                "Not verified"
+            )
+            or "Not verified"
         ),
 
         source=str(
-            data.get("source") or "Web verified"
+            result.get(
+                "source",
+                "Web verified"
+            )
+            or "Web verified"
         ),
 
-        platform_checks=platform_checks,
+        platform_checks=platform_checks
     )
 
 
+# ============================================================
+# TELEGRAM MESSAGE FORMAT
+# ============================================================
+
 def format_result(d: AnimeData) -> str:
 
-    eps = (
+    episodes = (
         str(d.episodes)
         if d.episodes is not None
         else "Not verified"
     )
 
-    langs = (
+    languages = (
         " • ".join(d.languages)
         if d.languages
         else "Not verified"
     )
 
-    last_ep = (
+    last_episode = (
         f"Episode {d.last_episode}"
         if d.last_episode is not None
         else "Not verified"
     )
 
-    next_ep = (
+    next_episode = (
         f"Episode {d.next_episode}"
         if d.next_episode is not None
         else "Not verified"
     )
 
-    hindi = (
+    hindi_status = (
         "✅ Available"
         if d.hindi
         else "❌ Not verified"
     )
 
+
     return f"""🎬 Anime: {d.title}
 
-🇮🇳 Hindi Dub: {hindi}
+🇮🇳 Hindi Dub: {hindi_status}
 📺 Platform: {d.platform}
 📀 Season: {d.season}
-🎬 Episodes: {eps}
+🎬 Episodes: {episodes}
 
-🌐 Languages: {langs}
+🌐 Languages: {languages}
 
 📊 Status: {d.status}
 
-📅 Last Episode: {last_ep}
+📅 Last Episode: {last_episode}
 🗓 Last Release: {d.last_release or "Not verified"}
 
-⏭ Next Episode: {next_ep}
+⏭ Next Episode: {next_episode}
 📅 Expected Release: {d.expected_release or "Not verified"}
 ⏰ Schedule: {d.schedule or "Not verified"}
 
