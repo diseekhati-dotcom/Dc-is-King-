@@ -1,104 +1,100 @@
 """
 anime_service.py
-Official-source-first anime availability checker for India.
+Official-source-only anime information checker.
 
-Required:
-    pip install httpx beautifulsoup4
-
-Recommended environment variable:
-    SERPAPI_KEY=...
-
-Without SERPAPI_KEY the service can still query direct official search URLs
-where possible, but results will be less reliable. The service NEVER uses
-RareToon or other unofficial anime streaming/download sites.
-
-Returned data is normalized for Telegram bot.py.
+IMPORTANT:
+- This service never searches, opens, or uses unofficial anime streaming/download sites.
+- Facts are accepted only from the approved official platform domains below.
+- A platform is NOT marked verified merely because a generic search result exists:
+  the result must contain the requested anime title (or a strong title match).
+- Missing information is returned as "Not verified" instead of being guessed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
-import asyncio
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 
+BUILD_ID = "official-v3"
 INDIA = "India"
 
+# Only these domains are allowed as evidence.
 PLATFORMS = {
     "Crunchyroll": {
         "domains": ["crunchyroll.com"],
-        "search": "site:crunchyroll.com/series/ {title}",
+        "query": 'site:crunchyroll.com/series/ "{title}"',
     },
     "Netflix": {
         "domains": ["netflix.com"],
-        "search": "site:netflix.com/title/ {title}",
+        "query": 'site:netflix.com/title/ "{title}"',
     },
     "Amazon Prime Video": {
         "domains": ["primevideo.com"],
-        "search": "site:primevideo.com/detail/ {title}",
+        "query": 'site:primevideo.com/detail/ "{title}"',
     },
     "Disney+": {
         "domains": ["disneyplus.com"],
-        "search": "site:disneyplus.com {title}",
+        "query": 'site:disneyplus.com "{title}"',
     },
     "JioHotstar": {
         "domains": ["hotstar.com", "jiohotstar.com"],
-        "search": "site:hotstar.com OR site:jiohotstar.com {title} anime",
+        "query": 'site:hotstar.com "{title}" anime',
     },
     "JioCinema": {
         "domains": ["jiocinema.com"],
-        "search": "site:jiocinema.com {title} anime",
+        "query": 'site:jiocinema.com "{title}" anime',
     },
     "Sony YAY!": {
         "domains": ["sonyyay.com", "sonypicturesnetworks.com"],
-        "search": "site:sonyyay.com {title} anime",
+        "query": 'site:sonyyay.com "{title}" anime',
     },
     "SonyLIV": {
         "domains": ["sonyliv.com"],
-        "search": "site:sonyliv.com {title} anime",
+        "query": 'site:sonyliv.com "{title}" anime',
     },
     "MX Player": {
         "domains": ["mxplayer.in", "amazon.com"],
-        "search": "site:mxplayer.in {title} anime",
+        "query": 'site:mxplayer.in "{title}" anime',
     },
     "YouTube": {
         "domains": ["youtube.com"],
-        "search": "site:youtube.com {title} anime official",
+        "query": 'site:youtube.com "{title}" anime official',
     },
     "Muse India": {
         "domains": ["youtube.com", "museindia.in"],
-        "search": "site:youtube.com/@MuseIndia {title}",
+        "query": 'site:youtube.com/@MuseIndia "{title}"',
     },
     "Ani-One Asia": {
         "domains": ["youtube.com", "ani-one.com"],
-        "search": "site:youtube.com Ani-One {title} India",
+        "query": 'site:youtube.com "{title}" "Ani-One" India',
     },
     "Animax": {
         "domains": ["animax-asia.com", "sony-asia.com"],
-        "search": "site:animax-asia.com {title}",
+        "query": 'site:animax-asia.com "{title}"',
     },
     "Cartoon Network": {
         "domains": ["cartoonnetworkasia.com", "cartoonnetwork.com"],
-        "search": "site:cartoonnetworkasia.com {title} anime",
+        "query": 'site:cartoonnetworkasia.com "{title}" anime',
     },
     "Nickelodeon": {
         "domains": ["nick.com", "nickelodeon.com"],
-        "search": "site:nick.com OR site:nickelodeon.com {title} anime",
+        "query": 'site:nick.com "{title}" anime',
     },
 }
 
 LANGUAGES = [
     "Hindi", "English", "Japanese", "Tamil", "Telugu", "Malayalam",
     "Kannada", "Bengali", "Marathi", "Korean", "Chinese", "Thai",
-    "Spanish", "French", "German", "Portuguese", "Arabic"
+    "Spanish", "French", "German", "Portuguese", "Arabic",
 ]
-
 
 @dataclass
 class PlatformResult:
@@ -109,7 +105,6 @@ class PlatformResult:
     subtitles: list[str] = field(default_factory=list)
     confidence: str = "unknown"
     note: str = ""
-
 
 @dataclass
 class AnimeResult:
@@ -126,6 +121,10 @@ class AnimeResult:
     source_count: int = 0
 
 
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def _host(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().removeprefix("www.")
@@ -138,58 +137,135 @@ def _official(url: str, domains: list[str]) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def _clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+def _normalize_title(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return _clean(text)
 
 
-def _langs(text: str) -> list[str]:
-    low = text.lower()
-    found = []
-    for lang in LANGUAGES:
-        if lang.lower() in low and lang not in found:
-            found.append(lang)
+def _title_match(query_title: str, result_title: str, snippet: str) -> bool:
+    wanted = _normalize_title(query_title)
+    haystack = _normalize_title(f"{result_title} {snippet}")
+
+    if not wanted or wanted not in haystack:
+        # Allow token matching for punctuation/colon differences.
+        tokens = [x for x in wanted.split() if len(x) > 1]
+        if not tokens or not all(x in haystack.split() for x in tokens):
+            return False
+
+    return True
+
+
+def _find_languages(text: str) -> list[str]:
+    """Extract languages only from likely audio/subtitle language sections."""
+    clean = _clean(text)
+    low = clean.lower()
+    chunks: list[str] = []
+
+    markers = [
+        "audio languages", "audio language", "audio:",
+        "dub languages", "dub language", "dub:",
+        "languages:", "language:",
+        "subtitles", "subtitle",
+    ]
+
+    for marker in markers:
+        start = 0
+        while True:
+            pos = low.find(marker, start)
+            if pos < 0:
+                break
+            chunks.append(clean[pos:pos + 350])
+            start = pos + len(marker)
+
+    # If no labelled section exists, do not treat every occurrence of
+    # "English/Japanese/etc." on the page as an audio track.
+    if not chunks:
+        return []
+
+    found: list[str] = []
+    for chunk in chunks:
+        low_chunk = chunk.lower()
+        for lang in LANGUAGES:
+            if re.search(rf"\b{re.escape(lang.lower())}\b", low_chunk):
+                if lang not in found:
+                    found.append(lang)
+
     return found
+
+
+def _extract_episode_count(text: str) -> Optional[int]:
+    patterns = [
+        r"\b(\d{1,4})\s+episodes?\b",
+        r"\bepisodes?\s*[:\-]?\s*(\d{1,4})\b",
+    ]
+    nums: list[int] = []
+    for pattern in patterns:
+        nums.extend(int(x) for x in re.findall(pattern, text, re.I))
+    return max(nums) if nums else None
+
+
+def _extract_episode_numbers(text: str) -> list[int]:
+    nums = re.findall(r"\b(?:episode|ep\.?)\s*(\d{1,4})\b", text, re.I)
+    return [int(x) for x in nums]
+
+
+def _extract_season(text: str) -> Optional[str]:
+    matches = re.findall(r"\bseason\s+(\d{1,2})\b", text, re.I)
+    if matches:
+        return max(matches, key=int)
+    return None
 
 
 def _status(text: str) -> str:
     low = text.lower()
-    if any(x in low for x in ["currently airing", "ongoing", "simulcast", "new episode"]):
+    if any(x in low for x in [
+        "currently airing", "ongoing", "simulcast", "new episode",
+        "airing now", "weekly",
+    ]):
         return "Ongoing"
-    if any(x in low for x in ["complete", "completed", "all episodes"]):
+    if any(x in low for x in [
+        "completed", "complete series", "all episodes available",
+        "all episodes",
+    ]):
         return "Completed"
-    if any(x in low for x in ["upcoming", "coming soon"]):
+    if any(x in low for x in ["upcoming", "coming soon", "premieres"]):
         return "Upcoming"
     return "Unknown"
 
 
-def _episodes(text: str) -> Optional[str]:
+def _explicit_next_episode(text: str) -> Optional[str]:
     patterns = [
-        r"\b(?:episode|ep\.?)\s*(\d{1,4})\b",
-        r"\b(\d{1,4})\s*episodes?\b",
+        r"next episode\s*(?:is|:|-)?\s*(?:episode|ep\.?)?\s*(\d{1,4})",
+        r"episode\s*(\d{1,4})\s*(?:is\s+)?(?:next|up next)",
+        r"up next\s*(?:is|:|-)?\s*(?:episode|ep\.?)?\s*(\d{1,4})",
     ]
-    nums = []
-    for p in patterns:
-        nums += [int(x) for x in re.findall(p, text, re.I)]
-    if not nums:
-        return None
-    return str(max(nums))
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return f"Episode {int(match.group(1))}"
+    return None
 
 
-def _extract_next_last(text: str) -> tuple[Optional[str], Optional[str]]:
-    nums = [int(x) for x in re.findall(r"\b(?:episode|ep\.?)\s*(\d{1,4})\b", text, re.I)]
-    if not nums:
-        return None, None
-    n = max(nums)
-    return f"Episode {n}", f"Episode {n + 1}"
+def _explicit_last_episode(text: str) -> Optional[str]:
+    patterns = [
+        r"last episode\s*(?:is|:|-)?\s*(?:episode|ep\.?)?\s*(\d{1,4})",
+        r"latest episode\s*(?:is|:|-)?\s*(?:episode|ep\.?)?\s*(\d{1,4})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return f"Episode {int(match.group(1))}"
+    return None
 
 
 async def _serp_search(client: httpx.AsyncClient, query: str) -> list[dict]:
-    key = os.getenv("SERPAPI_KEY")
+    key = os.getenv("SERPAPI_KEY", "").strip()
     if not key:
         return []
 
     try:
-        r = await client.get(
+        response = await client.get(
             "https://serpapi.com/search.json",
             params={
                 "engine": "google",
@@ -201,77 +277,96 @@ async def _serp_search(client: httpx.AsyncClient, query: str) -> list[dict]:
             },
             timeout=20,
         )
-        r.raise_for_status()
-        return r.json().get("organic_results", [])
+        response.raise_for_status()
+        data = response.json()
+        return data.get("organic_results", []) or []
     except Exception:
         return []
 
 
 async def _fetch_page(client: httpx.AsyncClient, url: str) -> str:
     try:
-        r = await client.get(
+        response = await client.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 AnimeInfoBot/1.0"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; AnimeInfoBot/3.0; +Telegram)"
+                )
+            },
             timeout=20,
             follow_redirects=True,
         )
-        if r.status_code >= 400:
+        if response.status_code >= 400:
             return ""
-        soup = BeautifulSoup(r.text, "html.parser")
-        for x in soup(["script", "style", "noscript"]):
-            x.decompose()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+
         return _clean(soup.get_text(" ", strip=True))
     except Exception:
         return ""
 
 
 async def _check_platform(
-    client: httpx.AsyncClient, title: str, name: str, cfg: dict
+    client: httpx.AsyncClient,
+    title: str,
+    name: str,
+    cfg: dict,
 ) -> PlatformResult:
-    query = cfg["search"].format(title=title)
-    results = await _serp_search(client, query)
-
-    official_results = [
-        x for x in results
-        if _official(x.get("link", ""), cfg["domains"])
-    ]
-
-    if not official_results:
-        return PlatformResult(
-            name=name,
-            available=False,
-            confidence="not_found",
-            note="No official India result found."
-        )
-
-    best = official_results[0]
-    url = best.get("link")
-    text = _clean(
-        " ".join([
-            best.get("title", ""),
-            best.get("snippet", ""),
-        ])
+    results = await _serp_search(
+        client, cfg["query"].format(title=title)
     )
 
-    # Fetch the official page when possible. Some platforms render data
-    # dynamically, so the search result itself remains a useful secondary
-    # official signal.
-    page_text = await _fetch_page(client, url)
-    combined = _clean(text + " " + page_text)
+    for item in results:
+        url = item.get("link", "")
+        result_title = item.get("title", "")
+        snippet = item.get("snippet", "")
 
-    audio = _langs(combined)
-    subtitles = _langs(combined)
+        if not _official(url, cfg["domains"]):
+            continue
 
-    # "available" means an official result was found. It does NOT claim
-    # every season/episode is available.
+        if not _title_match(title, result_title, snippet):
+            continue
+
+        page_text = await _fetch_page(client, url)
+        combined = _clean(f"{result_title} {snippet} {page_text}")
+
+        audio = _find_languages(combined)
+
+        # We intentionally do not label the same broad text as both audio
+        # and subtitles. Only audio is used for "Dub".
+        episode_count = _extract_episode_count(combined)
+        season = _extract_season(combined)
+        status = _status(combined)
+
+        notes = ["Exact/strong official title match found."]
+        if audio:
+            notes.append("Audio language evidence found on/near official page.")
+        else:
+            notes.append("Audio language not verified.")
+        if episode_count:
+            notes.append(f"Official text indicates {episode_count} episodes.")
+        if season:
+            notes.append(f"Official text indicates Season {season}.")
+        if status != "Unknown":
+            notes.append(f"Official text indicates {status}.")
+
+        return PlatformResult(
+            name=name,
+            available=True,
+            url=url,
+            audio=audio,
+            subtitles=[],
+            confidence="official_title_match",
+            note=" ".join(notes),
+        )
+
     return PlatformResult(
         name=name,
-        available=True,
-        url=url,
-        audio=audio,
-        subtitles=subtitles,
-        confidence="official_page",
-        note="Official platform result found; language availability may vary by season/episode."
+        available=False,
+        confidence="not_verified",
+        note="No matching official India result was verified.",
     )
 
 
@@ -283,54 +378,76 @@ async def search_anime(title: str) -> AnimeResult:
     result = AnimeResult(title=title)
 
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
-    async with httpx.AsyncClient(limits=limits) as client:
+
+    async with httpx.AsyncClient(
+        limits=limits,
+        follow_redirects=True,
+    ) as client:
         checks = [
             _check_platform(client, title, name, cfg)
             for name, cfg in PLATFORMS.items()
         ]
-        platforms = await asyncio.gather(*checks, return_exceptions=True)
+        checked = await asyncio.gather(*checks, return_exceptions=True)
 
-        for p in platforms:
-            if isinstance(p, PlatformResult):
-                result.platforms.append(p)
-                if p.available:
-                    result.source_count += 1
-                    result.languages.extend(p.audio)
+        for item in checked:
+            if not isinstance(item, PlatformResult):
+                continue
 
-        # Official-source searches for release/status information.
+            result.platforms.append(item)
+
+            if item.available:
+                result.source_count += 1
+                result.languages.extend(item.audio)
+
+        # Use official platform evidence for overall metadata.
+        evidence_parts: list[str] = []
+        for platform in result.platforms:
+            if platform.available:
+                evidence_parts.append(platform.note)
+
+        # Also do a small set of official-only metadata searches.
         meta_queries = [
-            f'site:crunchyroll.com "{title}" episode',
-            f'site:crunchyroll.com "{title}" season',
-            f'site:netflix.com/title "{title}"',
+            f'site:crunchyroll.com "{title}" "Episode"',
             f'site:primevideo.com/detail "{title}"',
+            f'site:netflix.com/title "{title}"',
         ]
 
-        meta_results = []
-        for q in meta_queries:
-            meta_results.extend(await _serp_search(client, q))
+        for query in meta_queries:
+            for item in await _serp_search(client, query):
+                url = item.get("link", "")
+                if not any(
+                    _official(url, cfg["domains"])
+                    for cfg in PLATFORMS.values()
+                ):
+                    continue
 
-        # Only use snippets/pages from our approved official domains.
-        approved = []
-        for item in meta_results:
-            url = item.get("link", "")
-            if any(_official(url, c["domains"]) for c in PLATFORMS.values()):
-                approved.append(
-                    _clean(item.get("title", "") + " " + item.get("snippet", ""))
+                snippet = _clean(
+                    f'{item.get("title", "")} {item.get("snippet", "")}'
                 )
+                if _title_match(title, item.get("title", ""), item.get("snippet", "")):
+                    evidence_parts.append(snippet)
 
-        meta_text = _clean(" ".join(approved))
+        evidence = _clean(" ".join(evidence_parts))
 
     result.languages = list(dict.fromkeys(result.languages))
-    result.dub = [x for x in result.languages if x in LANGUAGES and x != "Japanese"]
+    result.dub = [
+        language for language in result.languages
+        if language != "Japanese"
+    ]
 
-    result.status = _status(meta_text)
-    last, nxt = _extract_next_last(meta_text)
-    result.last_episode = last
-    result.next_episode = nxt
-    result.episodes = _episodes(meta_text)
+    result.status = _status(evidence)
+    result.seasons = _extract_season(evidence)
 
-    # Do not invent dates, season numbers, or episode counts.
-    # They remain None when the official source does not expose them.
+    count = _extract_episode_count(evidence)
+    result.episodes = str(count) if count is not None else None
+
+    result.last_episode = _explicit_last_episode(evidence)
+    result.next_episode = _explicit_next_episode(evidence)
+
+    # Never guess "next = last + 1".
+    # Never invent release/expected dates.
+    result.expected = None
+
     return result
 
 
@@ -340,48 +457,52 @@ def format_result(data: AnimeResult) -> str:
         "",
         f"🔊 Dub: {', '.join(data.dub) if data.dub else 'Not verified'}",
         "",
-        "📺 Platform:",
+        "📺 Official/Authorized Platforms:",
     ]
 
     available = [p for p in data.platforms if p.available]
-    if available:
-        for p in available:
-            langs = ", ".join(p.audio) if p.audio else "Language not verified"
-            lines.append(f"• {p.name} — {langs}")
-    else:
-        lines.append("• No official India platform result verified")
 
-    lines += [
+    if available:
+        for platform in available:
+            languages = (
+                ", ".join(platform.audio)
+                if platform.audio
+                else "Audio language not verified"
+            )
+            lines.append(f"• {platform.name} — {languages}")
+    else:
+        lines.append("• No official India platform verified")
+
+    lines.extend([
         "",
         f"📚 Season: {data.seasons or 'Not verified'}",
-        f"🎬 Episodes: {data.episodes + '+' if data.episodes else 'Not verified'}",
+        f"🎬 Episodes: {data.episodes or 'Not verified'}",
         f"🌐 Languages: {', '.join(data.languages) if data.languages else 'Not verified'}",
         f"📌 Status: {data.status}",
         f"🎬 Last Episode: {data.last_episode or 'Not verified'}",
         f"⏭️ Next Episode: {data.next_episode or 'Not verified'}",
         f"📅 Expected: {data.expected or 'TBA / Not verified'}",
-    ]
+    ])
 
     if available:
-        lines += ["", "🔗 Official sources:"]
-        for p in available[:8]:
-            if p.url:
-                lines.append(f"• {p.name}: {p.url}")
+        lines.extend(["", "🔗 Verified official pages:"])
+        for platform in available[:8]:
+            if platform.url:
+                lines.append(f"• {platform.name}: {platform.url}")
 
-    lines += [
+    lines.extend([
         "",
-        "⚠️ Language/episode availability can differ by season or episode."
-    ]
+        "ℹ️ Data is shown only when it can be verified from an approved official/authorized source.",
+        f"🛠 Build: {BUILD_ID}",
+    ])
+
     return "\n".join(lines)
 
 
 async def get_anime_info(title: str) -> dict:
-    """Main function for bot.py."""
-    result = await search_anime(title)
-    return asdict(result)
+    return asdict(await search_anime(title))
 
 
-# Synchronous helper for older bot.py files.
 def get_anime_info_sync(title: str) -> dict:
     return asyncio.run(get_anime_info(title))
 
@@ -396,4 +517,5 @@ if __name__ == "__main__":
 
     data = get_anime_info_sync(anime)
     print(format_result(AnimeResult(**data)))
+    
  
