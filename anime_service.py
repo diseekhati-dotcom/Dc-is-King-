@@ -76,6 +76,10 @@ class AnimeData:
 
     season: str = "Not verified"
     episodes: Optional[int] = None
+    hindi_episodes: Optional[int] = None
+    last_hindi_episode: Optional[int] = None
+    next_hindi_episode: Optional[int] = None
+    hindi_expected_release: Optional[str] = None
 
     languages: List[str] = field(default_factory=list)
 
@@ -179,7 +183,7 @@ HINDI DUB VERIFICATION
 
 Hindi dubbing must NOT be guessed.
 
-Hindi is VERIFIED only when a reliable source confirms it.
+Hindi is VERIFIED only when a reliable source confirms it. Hindi subtitles do NOT count as Hindi dubbing. Never assume every episode is dubbed just because Hindi is listed for the series.
 
 Examples of evidence:
 
@@ -219,12 +223,15 @@ EPISODE INFORMATION
 
 Find:
 
-- total episodes
+- total episodes currently released
 - current/latest episode
 - last release date
 - next episode
 - expected release date
 - release schedule
+- Hindi-dub episode count (SEPARATE from total episodes)
+- latest episode with Hindi audio
+- next Hindi-dub episode and official expected date, if available
 
 Cross-check episode information.
 
@@ -315,6 +322,10 @@ Use exactly this structure:
     "season": "Season 1",
 
     "episodes": 12,
+    "hindi_episodes": 3,
+    "last_hindi_episode": 3,
+    "next_hindi_episode": 4,
+    "hindi_expected_release": "2026-09-20",
 
     "languages": [
         "Japanese",
@@ -526,6 +537,11 @@ Rules:
             "episodes"
         ),
 
+        hindi_episodes=result.get("hindi_episodes"),
+        last_hindi_episode=result.get("last_hindi_episode"),
+        next_hindi_episode=result.get("next_hindi_episode"),
+        hindi_expected_release=result.get("hindi_expected_release"),
+
         languages=(
             result.get(
                 "languages",
@@ -590,63 +606,36 @@ Rules:
     )
 
 
+
 # ============================================================
 # TELEGRAM MESSAGE FORMAT
 # ============================================================
 
 def format_result(d: AnimeData) -> str:
+    episodes = str(d.episodes) if d.episodes is not None else "Not verified"
+    languages = ", ".join(d.languages) if d.languages else "Not verified"
+    dub = "Hindi" if d.hindi else "Not verified"
+    hindi_count = str(d.hindi_episodes) if d.hindi_episodes is not None else "Not verified"
 
-    episodes = (
-        str(d.episodes)
-        if d.episodes is not None
-        else "Not verified"
-    )
+    last_episode = f"Episode {d.last_episode}" if d.last_episode is not None else "Not verified"
+    next_episode = f"Episode {d.next_episode}" if d.next_episode is not None else "Not verified"
+    last_hindi = f"Episode {d.last_hindi_episode}" if d.last_hindi_episode is not None else "Not verified"
+    next_hindi = f"Episode {d.next_hindi_episode}" if d.next_hindi_episode is not None else "Not verified"
 
-    languages = (
-        " • ".join(d.languages)
-        if d.languages
-        else "Not verified"
-    )
-
-    last_episode = (
-        f"Episode {d.last_episode}"
-        if d.last_episode is not None
-        else "Not verified"
-    )
-
-    next_episode = (
-        f"Episode {d.next_episode}"
-        if d.next_episode is not None
-        else "Not verified"
-    )
-
-    hindi_status = (
-        "✅ Available"
-        if d.hindi
-        else "❌ Not verified"
-    )
-
-
-    return f"""🎬 Anime: {d.title}
-
-🇮🇳 Hindi Dub: {hindi_status}
-📺 Platform: {d.platform}
-📀 Season: {d.season}
-🎬 Episodes: {episodes}
-
-🌐 Languages: {languages}
-
-📊 Status: {d.status}
-
-📅 Last Episode: {last_episode}
-🗓 Last Release: {d.last_release or "Not verified"}
-
-⏭ Next Episode: {next_episode}
-📅 Expected Release: {d.expected_release or "Not verified"}
-⏰ Schedule: {d.schedule or "Not verified"}
-
-🏢 Studio: {d.studio}
-🎙 Dub By: {d.dub_by}
-
-🔎 Source: {d.source}
-"""
+    return (
+        f"🎌 Anime: {d.title}\n\n"
+        f"🇮🇳 Dub: {dub}\n"
+        f"📺 Platform: {d.platform}\n\n"
+        f"📚 Season: {d.season}\n"
+        f"🎬 Episodes: {episodes}\n\n"
+        f"🌐 Languages: {languages}\n"
+        f"📌 Status: {d.status}\n\n"
+        f"🎬 Last Episode: {last_episode}\n"
+        f"⏭️ Next Episode: {next_episode}\n"
+        f"📅 Expected: {d.expected_release or 'Not verified'}\n\n"
+        f"🇮🇳 Hindi Episodes: {hindi_count}\n"
+        f"🇮🇳 Last Hindi Episode: {last_hindi}\n"
+        f"⏭️ Next Hindi Episode: {next_hindi}\n"
+        f"📅 Hindi Expected: {d.hindi_expected_release or 'Not verified'}\n"
+)
+        
